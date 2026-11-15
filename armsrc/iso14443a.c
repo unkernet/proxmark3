@@ -817,6 +817,14 @@ RAMFUNC int ManchesterDecoding_Thinfilm(uint8_t bit, uint32_t non_real_time) {
     return false;    // not finished yet, need more data
 }
 
+// Reader field detection in sniff, on the ARM ADC (AMPL_HI). Raw thresholds with hysteresis,
+// tuned on PM3 generic: no field reads 0..3, a reader field 12..30, a phone up to 150+.
+// The FPGA reader bits can't be used: it reports "unmodulated" once the field is gone.
+#define SNIFF_FIELD_OFF_ADC         6
+#define SNIFF_FIELD_ON_ADC          10
+// consecutive ADC reads (~11 us each) past a threshold before a field change is logged
+#define SNIFF_FIELD_CHANGE_READS    3
+
 //=============================================================================
 // Finally, a `sniffer' for ISO 14443 Type A
 // Both sides of communication!
@@ -891,6 +899,17 @@ int RAMFUNC SniffIso14443a(uint8_t param) {
     uint32_t dma_stalls = 0;
     uint16_t checker = 12000;
 
+    // reader field on/off tracking, one DMA sample = 64 carrier cycles
+    bool field_on = true;
+    uint8_t field_cnt = 0;
+    uint32_t field_start = 0;
+    AdcSetupRssiChannel(ADC_RSSI_CH_HF);
+#ifndef PM5
+    // ADC_CLK = 3 MHz, ~11 us per conversion
+    AT91C_BASE_ADC->ADC_MR = ADC_MODE_PRESCALE(7) | ADC_MODE_STARTUP_TIME(1) | ADC_MODE_SAMPLE_HOLD_TIME(15);
+    AdcRssiConversionStart();
+#endif
+
     // loop and listen
     while (BUTTON_PRESS() == false) {
         WDT_HIT();
@@ -919,6 +938,7 @@ int RAMFUNC SniffIso14443a(uint8_t param) {
             rx_samples += DMA_BUFFER_SIZE;
             Uart14aReset();
             Demod14aReset();
+            field_cnt = 0;
             dma_stalls++;
             continue;
         }
@@ -932,6 +952,7 @@ int RAMFUNC SniffIso14443a(uint8_t param) {
             rx_samples += dataLen;
             Uart14aReset();
             Demod14aReset();
+            field_cnt = 0;
             overrun_skips++;
             continue;
         }
@@ -947,6 +968,35 @@ int RAMFUNC SniffIso14443a(uint8_t param) {
         }
 
         LED_A_OFF();
+
+        // Field on/off markers, logged as 1-byte reader frames 0x0F (on) / 0xF0 (off)
+        if (AdcRssiDataReady(ADC_RSSI_CH_HF)) {
+            uint32_t adc = AdcRssiDataRead(ADC_RSSI_CH_HF);
+            AdcRssiConversionStart();
+
+            bool past = field_on ? (adc < SNIFF_FIELD_OFF_ADC) : (adc > SNIFF_FIELD_ON_ADC);
+            if (past) {
+                if (field_cnt == 0) {
+                    // ADC is real time, the decoders lag behind by the unprocessed DMA samples
+                    field_start = rx_samples + dataLen;
+                }
+                if (++field_cnt >= SNIFF_FIELD_CHANGE_READS) {
+                    field_on = !field_on;
+                    field_cnt = 0;
+                    if (triggered) {
+                        uint8_t marker = field_on ? 0x0F : 0xF0;
+                        uint8_t marker_par = 0x80;  // odd parity of either marker is 1
+                        uint32_t ts = field_start * 64;
+                        ts = (ts > DELAY_READER_AIR2ARM_AS_SNIFFER) ? ts - DELAY_READER_AIR2ARM_AS_SNIFFER : 0;
+                        if (LogTrace(&marker, 1, ts, ts + 16, &marker_par, true) == false) {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                field_cnt = 0;
+            }
+        }
 
         // Need two samples to feed Miller and Manchester-Decoder
         if (rx_samples & 0x01) {
